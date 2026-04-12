@@ -42,7 +42,7 @@ poly_SE_to_keep = [SE for SE in poly_SE_counts if poly_SE_counts[SE] >= 500]  # 
 dfs['polypharmacy'] = dfs['polypharmacy'].loc[dfs['polypharmacy']['r'].isin(poly_SE_to_keep)]
 
 # Save core graph to disk in LibKGE format
-core_network = dfs['ppi'].append(dfs['drug-target'])
+core_network = pd.concat([dfs['ppi'], dfs['drug-target']], ignore_index=True)
 core_network.to_csv('core_network_ppi_drugtarget.tsv', index=False, header=None, sep='\t')
 
 # Save Mono-/Polypharmacy side effect data to disk in LibKGE format
