@@ -1,0 +1,61 @@
+import:
+  - simple
+
+job.type: train
+
+dataset.name: selfloops    # path to your LibKGE dataset directory
+
+model: simple
+
+train:
+  type: 1vsAll
+  loss: kl
+  optimizer: Adam
+  optimizer_args:
+    lr: 0.01076
+  batch_size: 256
+  max_epochs: 500
+  auto_correct: true
+  subbatch_auto_tune: true
+  lr_scheduler: ReduceLROnPlateau
+  lr_scheduler_args:
+    mode: max
+    factor: 0.5
+    patience: 5          # from best_traces (train.lr_scheduler_args.patience)
+    threshold: 0.0001
+
+lookup_embedder:
+  dim: 256
+  initialize: xavier_normal_
+  initialize_args:
+    xavier_normal_:
+      gain: 1.0
+
+simple:
+  entity_embedder:
+    dropout: 0.068
+    regularize: lp
+    regularize_args:
+      weighted: true
+    regularize_weight: 1.647e-19    # effectively no regularisation
+  relation_embedder:
+    dropout: 0.125
+    regularize: lp
+    regularize_args:
+      weighted: true
+    regularize_weight: 3.692e-18
+
+eval:
+  batch_size: 256
+  metrics_per:
+    relation_type: true
+
+valid:
+  every: 5
+  metric: mean_reciprocal_rank_filtered_with_test
+  filter_with_test: true
+  early_stopping:
+    min_threshold:
+      epochs: 50
+      metric_value: 0.1
+    patience: 10          # stop if no improvement after 10 checks (= 50 epochs)
