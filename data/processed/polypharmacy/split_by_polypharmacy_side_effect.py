@@ -18,13 +18,15 @@ poly_edges = pd.read_csv('../../raw/bio-decagon-combo.csv')['Polypharmacy Side E
 # Create holdout data that has 10% of each polypharmacy side effect
 done = False
 while not done:
-    train_df = pd.DataFrame()
-    holdout_df = pd.DataFrame()
+    train_chunks = []
+    holdout_chunks = []
     for edge_type, subdf in edges.groupby(1):
         if edge_type in poly_edges:
             train_edges, test_edges = train_test_split(subdf, test_size=0.1)
-            train_df = train_df.append(train_edges)
-            holdout_df = holdout_df.append(test_edges)
+            train_chunks.append(train_edges)
+            holdout_chunks.append(test_edges)
+    train_df = pd.concat(train_chunks, ignore_index=True)
+    holdout_df = pd.concat(holdout_chunks, ignore_index=True)
 
     holdout_nodes = set()
     train_nodes = set()
