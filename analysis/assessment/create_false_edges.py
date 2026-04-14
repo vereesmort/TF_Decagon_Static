@@ -42,15 +42,14 @@ if __name__ == '__main__':
         index_col=0
     ).to_dict()[1]
 
-    full_edgelist = pd.DataFrame()
-    for split in ['train', 'test', 'valid']:
-        full_edgelist = full_edgelist.append(
-            pd.read_csv(
-                f'{args.libkge_data_dir}/{split}.del',
-                sep='\t',
-                header=None
-            )
+    full_edgelist = pd.concat([
+        pd.read_csv(
+            f'{args.libkge_data_dir}/{split}.del',
+            sep='\t',
+            header=None
         )
+        for split in ['train', 'test', 'valid']
+    ], ignore_index=True)
 
     holdout = pd.read_csv(
         '../../data/processed/polypharmacy/holdout_polypharmacy.tsv',
