@@ -139,17 +139,17 @@ class _DriveSyncCallback(TrainingCallback):
 
 
 class _WandbLoggingCallback(TrainingCallback):
-    """Logs training loss, LR, validation MRR, and Hits@k (when EarlyStopper updates).
+    """Logs training loss, LR, validation MRR and Hits@k to Weights & Biases.
 
-    Metrics logged every epoch:
+    Logged every epoch:
       train/loss  — LCWA cross-entropy loss
-      train/lr    — current learning rate (reflects ReduceLROnPlateau steps)
+      train/lr    — learning rate (reflects ReduceLROnPlateau steps)
 
-    Metrics logged every es_frequency epochs (when EarlyStopper evaluates):
-      val/mrr         — Mean Reciprocal Rank on valid_tf
-      val/hits_at_1   — Hits@1
-      val/hits_at_3   — Hits@3
-      val/hits_at_10  — Hits@10 (standard KGE reporting metric)
+    Logged every es_frequency epochs (when EarlyStopper runs evaluation):
+      val/mrr        — Mean Reciprocal Rank on valid_tf
+      val/hits_at_1  — Hits@1
+      val/hits_at_3  — Hits@3
+      val/hits_at_10 — Hits@10
     """
 
     def __init__(self, stopper: EarlyStopper):
@@ -161,6 +161,9 @@ class _WandbLoggingCallback(TrainingCallback):
         import wandb
 
         lr = float(self.optimizer.param_groups[0]["lr"])
+        # Use "epoch" as the x-axis value directly in the payload.
+        # Do NOT pass step= to wandb.log — mixing step= with a payload key
+        # that defines the x-axis causes wandb to ignore the custom axis.
         payload = {
             "epoch": epoch,
             "train/loss": float(epoch_loss),
@@ -172,20 +175,19 @@ class _WandbLoggingCallback(TrainingCallback):
             self._n_results_seen = len(results)
             payload["val/mrr"] = float(results[-1])
 
-            # Pull Hits@k from the stopper's last full metric result object.
-            # EarlyStopper stores these as stopper.metric_results (list of
-            # RankBasedMetricResults). Fall back silently if unavailable.
+            # Hits@k — available from stopper.metric_results if pykeen >= 1.9
             metric_results = getattr(self._stopper, "metric_results", [])
             if metric_results:
                 mr = metric_results[-1]
                 for k in (1, 3, 10):
                     try:
-                        val = mr.get_metric(f"hits_at_{k}")
-                        payload[f"val/hits_at_{k}"] = float(val)
+                        payload[f"val/hits_at_{k}"] = float(
+                            mr.get_metric(f"hits_at_{k}")
+                        )
                     except Exception:
-                        pass
+                        pass  # metric unavailable in this pykeen version
 
-        wandb.log(payload, step=epoch)
+        wandb.log(payload)  # no step= — epoch key in payload drives the x-axis
 
 
 # ---------------------------------------------------------------------------
@@ -254,10 +256,10 @@ parser.add_argument("--ses", nargs="+", default=None,
                          "(e.g. --ses C0034065 C0020473). "
                          "Full vocabulary is kept for assessment.")
 parser.add_argument("--num_ses", type=int, default=None,
-                    help="Train on the first N side effects by relation ID order "
+                    help="Train on the first N side effects by relation ID "
                          "(e.g. --num_ses 50 for a fast test run). "
-                         "Ignored if --ses is also set. "
-                         "Full vocabulary is kept so assessment still works.")
+                         "Ignored if --ses is also set. Full vocabulary is "
+                         "kept so assessment still works.")
 parser.add_argument("--wandb_project", type=str, default=None,
                     help="Weights & Biases project; enables logging when set.")
 parser.add_argument("--wandb_entity", type=str, default=None,
@@ -310,8 +312,8 @@ print(f"  entities: {train_tf.num_entities:,}  "
 # ---------------------------------------------------------------------------
 # 1b. Optional SE subset filter
 #     --ses    : explicit list of SE relation names
-#     --num_ses: shortcut — take the first N PSE relations by integer ID
-#     If both are given, --ses takes priority.
+#     --num_ses: shortcut — first N PSE relations by sorted integer ID
+#     Both preserve full vocab so assessment against all 963 SEs still works.
 # ---------------------------------------------------------------------------
 if args.ses is not None or args.num_ses is not None:
     from pykeen.triples import CoreTriplesFactory
@@ -319,25 +321,22 @@ if args.ses is not None or args.num_ses is not None:
         _rel2id = json.load(_f)
 
     if args.ses is not None:
-        # Explicit SE names supplied via --ses
         unknown = [s for s in args.ses if s not in _rel2id]
         if unknown:
             raise ValueError(f"Unknown SE names (not in relation_to_id.json): {unknown}")
         ses_ids = torch.tensor([_rel2id[s] for s in args.ses], dtype=torch.long)
         _subset_label = f"{len(args.ses)} named SEs"
     else:
-        # --num_ses: pick the first N PSE relation IDs in sorted integer order.
-        # Filters to IDs that actually appear in training triples so we do not
-        # accidentally pick structural meta-relations (drug-target, PPI).
+        # Pick first N PSE relation IDs that actually appear in training triples
+        # (sorted by integer ID so selection is deterministic).
         _id2rel = {v: k for k, v in _rel2id.items()}
         pse_ids_in_train = torch.unique(train_tf.mapped_triples[:, 1]).tolist()
         pse_ids_sorted   = sorted(int(i) for i in pse_ids_in_train)
-        chosen_ids  = pse_ids_sorted[:args.num_ses]
-        ses_ids     = torch.tensor(chosen_ids, dtype=torch.long)
-        chosen_names = [_id2rel[i] for i in chosen_ids]
-        _subset_label = f"first {len(chosen_ids)} SEs by relation ID"
-        print(f"  --num_ses {args.num_ses}: relation IDs "
-              f"{chosen_ids[0]}–{chosen_ids[-1]}  "
+        chosen_ids       = pse_ids_sorted[:args.num_ses]
+        ses_ids          = torch.tensor(chosen_ids, dtype=torch.long)
+        chosen_names     = [_id2rel[i] for i in chosen_ids]
+        _subset_label    = f"first {len(chosen_ids)} SEs by relation ID"
+        print(f"  --num_ses {args.num_ses}: IDs {chosen_ids[0]}–{chosen_ids[-1]} "
               f"({chosen_names[0]} … {chosen_names[-1]})")
 
     def _filter_tf(tf):
@@ -559,7 +558,8 @@ if _use_wandb:
             "num_ses": args.num_ses,
         },
     )
-    # Tell wandb that "epoch" is the x-axis for all custom metrics.
+    # define_metric tells wandb to use "epoch" as the x-axis for all
+    # train/* and val/* panels. Must be called right after wandb.init().
     wandb.define_metric("epoch")
     wandb.define_metric("train/*", step_metric="epoch")
     wandb.define_metric("val/*",   step_metric="epoch")
