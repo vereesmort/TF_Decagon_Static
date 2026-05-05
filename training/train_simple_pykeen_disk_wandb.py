@@ -139,7 +139,7 @@ class _DriveSyncCallback(TrainingCallback):
 
 
 class _WandbLoggingCallback(TrainingCallback):
-    """Logs training loss, LR, validation MRR and Hits@k to Weights & Biases.
+    """Logs training loss, LR, validation MRR and Hits@k via a wandb run object.
 
     Logged every epoch:
       train/loss  — LCWA cross-entropy loss
@@ -152,22 +152,18 @@ class _WandbLoggingCallback(TrainingCallback):
       val/hits_at_10 — Hits@10
     """
 
-    def __init__(self, stopper: EarlyStopper):
+    def __init__(self, stopper: EarlyStopper, run):
         super().__init__()
         self._stopper = stopper
+        self._run = run          # wandb run object returned by wandb.init()
         self._n_results_seen = 0
 
     def post_epoch(self, epoch: int, epoch_loss: float, **kwargs) -> None:
-        import wandb
-
         lr = float(self.optimizer.param_groups[0]["lr"])
-        # Use "epoch" as the x-axis value directly in the payload.
-        # Do NOT pass step= to wandb.log — mixing step= with a payload key
-        # that defines the x-axis causes wandb to ignore the custom axis.
         payload = {
-            "epoch": epoch,
+            "epoch":      epoch,
             "train/loss": float(epoch_loss),
-            "train/lr": lr,
+            "train/lr":   lr,
         }
 
         results = getattr(self._stopper, "results", [])
@@ -175,7 +171,7 @@ class _WandbLoggingCallback(TrainingCallback):
             self._n_results_seen = len(results)
             payload["val/mrr"] = float(results[-1])
 
-            # Hits@k — available from stopper.metric_results if pykeen >= 1.9
+            # Hits@k — stopper.metric_results available in pykeen >= 1.9
             metric_results = getattr(self._stopper, "metric_results", [])
             if metric_results:
                 mr = metric_results[-1]
@@ -185,9 +181,9 @@ class _WandbLoggingCallback(TrainingCallback):
                             mr.get_metric(f"hits_at_{k}")
                         )
                     except Exception:
-                        pass  # metric unavailable in this pykeen version
+                        pass
 
-        wandb.log(payload)  # no step= — epoch key in payload drives the x-axis
+        self._run.log(payload)   # use run object, not module-level wandb.log
 
 
 # ---------------------------------------------------------------------------
@@ -258,8 +254,7 @@ parser.add_argument("--ses", nargs="+", default=None,
 parser.add_argument("--num_ses", type=int, default=None,
                     help="Train on the first N side effects by relation ID "
                          "(e.g. --num_ses 50 for a fast test run). "
-                         "Ignored if --ses is also set. Full vocabulary is "
-                         "kept so assessment still works.")
+                         "Ignored if --ses is also set.")
 parser.add_argument("--wandb_project", type=str, default=None,
                     help="Weights & Biases project; enables logging when set.")
 parser.add_argument("--wandb_entity", type=str, default=None,
@@ -327,7 +322,7 @@ if args.ses is not None or args.num_ses is not None:
         ses_ids = torch.tensor([_rel2id[s] for s in args.ses], dtype=torch.long)
         _subset_label = f"{len(args.ses)} named SEs"
     else:
-        # Pick first N PSE relation IDs that actually appear in training triples
+        # Pick first N PSE relation IDs that appear in training triples
         # (sorted by integer ID so selection is deterministic).
         _id2rel = {v: k for k, v in _rel2id.items()}
         pse_ids_in_train = torch.unique(train_tf.mapped_triples[:, 1]).tolist()
@@ -498,13 +493,12 @@ sync_callback = _DriveSyncCallback(
 )
 
 _use_wandb = bool(args.wandb_project) and not args.no_wandb
-_train_callbacks = [lr_callback, last_ckpt_callback, sync_callback]
-if _use_wandb:
-    _train_callbacks.append(_WandbLoggingCallback(stopper=stopper))
 
 # ---------------------------------------------------------------------------
-# 9. Train
+# 9. Initialise W&B run (must happen before callbacks are built so the run
+#    object can be passed into _WandbLoggingCallback)
 # ---------------------------------------------------------------------------
+_wb_run = None
 if _use_wandb:
     try:
         import wandb
@@ -521,7 +515,10 @@ if _use_wandb:
             f"{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         )
     _param_count = sum(p.numel() for p in model.parameters())
-    wandb.init(
+
+    # Store the run object — use run.log() everywhere instead of wandb.log()
+    # to avoid silent failures in Colab / Jupyter notebook environments.
+    _wb_run = wandb.init(
         project=args.wandb_project,
         entity=args.wandb_entity,
         name=_wb_run_name,
@@ -558,12 +555,19 @@ if _use_wandb:
             "num_ses": args.num_ses,
         },
     )
-    # define_metric tells wandb to use "epoch" as the x-axis for all
-    # train/* and val/* panels. Must be called right after wandb.init().
-    wandb.define_metric("epoch")
-    wandb.define_metric("train/*", step_metric="epoch")
-    wandb.define_metric("val/*",   step_metric="epoch")
+    # define_metric sets epoch as the x-axis for all train/* and val/* charts.
+    _wb_run.define_metric("epoch")
+    _wb_run.define_metric("train/*", step_metric="epoch")
+    _wb_run.define_metric("val/*",   step_metric="epoch")
     print(f"  W&B: project={args.wandb_project!r}  run={_wb_run_name!r}")
+
+_train_callbacks = [lr_callback, last_ckpt_callback, sync_callback]
+if _use_wandb:
+    _train_callbacks.append(_WandbLoggingCallback(stopper=stopper, run=_wb_run))
+
+# ---------------------------------------------------------------------------
+# 10. Train
+# ---------------------------------------------------------------------------
 
 print(f"\nStarting training (max {args.max_epochs} epochs)...")
 print(f"  embedding_dim={args.embedding_dim}  lr={args.lr}  "
@@ -589,7 +593,7 @@ try:
     )
 
     # -----------------------------------------------------------------------
-    # 10. Final sync + save results
+    # 11. Final sync + save results
     # -----------------------------------------------------------------------
     print("\nFinal sync: local → Drive...")
     _sync_checkpoints(checkpoint_dir, drive_checkpoint_dir, silent=False)
@@ -604,7 +608,7 @@ try:
 
         art = wandb.Artifact("training_losses", type="results")
         art.add_file(results_path)
-        wandb.log_artifact(art)
+        _wb_run.log_artifact(art)
 
     print(f"Best checkpoint (Drive): {drive_checkpoint_dir}/checkpoint_best.pt")
     print(f"Run assessment with:")
@@ -616,4 +620,4 @@ finally:
     if _use_wandb:
         import wandb
 
-        wandb.finish()
+        _wb_run.finish()
