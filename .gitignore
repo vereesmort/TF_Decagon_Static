@@ -12,3 +12,4 @@ analysis/false_start/checkpoints
 analysis/experiments/non-naive
 analysis/experiments/selfloops
 **/*.pt
+/results/
