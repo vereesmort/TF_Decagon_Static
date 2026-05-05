@@ -139,7 +139,18 @@ class _DriveSyncCallback(TrainingCallback):
 
 
 class _WandbLoggingCallback(TrainingCallback):
-    """Logs training loss, LR, and validation MRR (when EarlyStopper updates)."""
+    """Logs training loss, LR, validation MRR, and Hits@k (when EarlyStopper updates).
+
+    Metrics logged every epoch:
+      train/loss  — LCWA cross-entropy loss
+      train/lr    — current learning rate (reflects ReduceLROnPlateau steps)
+
+    Metrics logged every es_frequency epochs (when EarlyStopper evaluates):
+      val/mrr         — Mean Reciprocal Rank on valid_tf
+      val/hits_at_1   — Hits@1
+      val/hits_at_3   — Hits@3
+      val/hits_at_10  — Hits@10 (standard KGE reporting metric)
+    """
 
     def __init__(self, stopper: EarlyStopper):
         super().__init__()
@@ -151,13 +162,29 @@ class _WandbLoggingCallback(TrainingCallback):
 
         lr = float(self.optimizer.param_groups[0]["lr"])
         payload = {
+            "epoch": epoch,
             "train/loss": float(epoch_loss),
             "train/lr": lr,
         }
+
         results = getattr(self._stopper, "results", [])
         if len(results) > self._n_results_seen:
             self._n_results_seen = len(results)
-            payload["val/mean_reciprocal_rank"] = float(results[-1])
+            payload["val/mrr"] = float(results[-1])
+
+            # Pull Hits@k from the stopper's last full metric result object.
+            # EarlyStopper stores these as stopper.metric_results (list of
+            # RankBasedMetricResults). Fall back silently if unavailable.
+            metric_results = getattr(self._stopper, "metric_results", [])
+            if metric_results:
+                mr = metric_results[-1]
+                for k in (1, 3, 10):
+                    try:
+                        val = mr.get_metric(f"hits_at_{k}")
+                        payload[f"val/hits_at_{k}"] = float(val)
+                    except Exception:
+                        pass
+
         wandb.log(payload, step=epoch)
 
 
@@ -226,6 +253,11 @@ parser.add_argument("--ses", nargs="+", default=None,
                     help="Optional subset of SE relation names to train on "
                          "(e.g. --ses C0034065 C0020473). "
                          "Full vocabulary is kept for assessment.")
+parser.add_argument("--num_ses", type=int, default=None,
+                    help="Train on the first N side effects by relation ID order "
+                         "(e.g. --num_ses 50 for a fast test run). "
+                         "Ignored if --ses is also set. "
+                         "Full vocabulary is kept so assessment still works.")
 parser.add_argument("--wandb_project", type=str, default=None,
                     help="Weights & Biases project; enables logging when set.")
 parser.add_argument("--wandb_entity", type=str, default=None,
@@ -277,17 +309,36 @@ print(f"  entities: {train_tf.num_entities:,}  "
 
 # ---------------------------------------------------------------------------
 # 1b. Optional SE subset filter
+#     --ses    : explicit list of SE relation names
+#     --num_ses: shortcut — take the first N PSE relations by integer ID
+#     If both are given, --ses takes priority.
 # ---------------------------------------------------------------------------
-if args.ses is not None:
+if args.ses is not None or args.num_ses is not None:
     from pykeen.triples import CoreTriplesFactory
     with open(os.path.join(args.dataset_dir, "relation_to_id.json")) as _f:
         _rel2id = json.load(_f)
 
-    unknown = [s for s in args.ses if s not in _rel2id]
-    if unknown:
-        raise ValueError(f"Unknown SE names (not in relation_to_id.json): {unknown}")
-
-    ses_ids = torch.tensor([_rel2id[s] for s in args.ses], dtype=torch.long)
+    if args.ses is not None:
+        # Explicit SE names supplied via --ses
+        unknown = [s for s in args.ses if s not in _rel2id]
+        if unknown:
+            raise ValueError(f"Unknown SE names (not in relation_to_id.json): {unknown}")
+        ses_ids = torch.tensor([_rel2id[s] for s in args.ses], dtype=torch.long)
+        _subset_label = f"{len(args.ses)} named SEs"
+    else:
+        # --num_ses: pick the first N PSE relation IDs in sorted integer order.
+        # Filters to IDs that actually appear in training triples so we do not
+        # accidentally pick structural meta-relations (drug-target, PPI).
+        _id2rel = {v: k for k, v in _rel2id.items()}
+        pse_ids_in_train = torch.unique(train_tf.mapped_triples[:, 1]).tolist()
+        pse_ids_sorted   = sorted(int(i) for i in pse_ids_in_train)
+        chosen_ids  = pse_ids_sorted[:args.num_ses]
+        ses_ids     = torch.tensor(chosen_ids, dtype=torch.long)
+        chosen_names = [_id2rel[i] for i in chosen_ids]
+        _subset_label = f"first {len(chosen_ids)} SEs by relation ID"
+        print(f"  --num_ses {args.num_ses}: relation IDs "
+              f"{chosen_ids[0]}–{chosen_ids[-1]}  "
+              f"({chosen_names[0]} … {chosen_names[-1]})")
 
     def _filter_tf(tf):
         mask = torch.isin(tf.mapped_triples[:, 1], ses_ids)
@@ -300,7 +351,7 @@ if args.ses is not None:
     train_tf = _filter_tf(train_tf)
     valid_tf = _filter_tf(valid_tf)
     test_tf  = _filter_tf(test_tf)
-    print(f"  SE subset ({len(args.ses)} types) → "
+    print(f"  SE subset ({_subset_label}) → "
           f"train: {train_tf.num_triples:,}  "
           f"valid: {valid_tf.num_triples:,}  "
           f"test:  {test_tf.num_triples:,}")
@@ -505,8 +556,13 @@ if _use_wandb:
             "resume": args.resume,
             "pretrained_entities": args.pretrained_entities,
             "ses": args.ses,
+            "num_ses": args.num_ses,
         },
     )
+    # Tell wandb that "epoch" is the x-axis for all custom metrics.
+    wandb.define_metric("epoch")
+    wandb.define_metric("train/*", step_metric="epoch")
+    wandb.define_metric("val/*",   step_metric="epoch")
     print(f"  W&B: project={args.wandb_project!r}  run={_wb_run_name!r}")
 
 print(f"\nStarting training (max {args.max_epochs} epochs)...")
