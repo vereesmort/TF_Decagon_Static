@@ -555,6 +555,10 @@ if _use_wandb:
             "num_ses": args.num_ses,
         },
     )
+    # TEMP DEBUG — remove after confirming charts appear
+    _wb_run.log({"epoch": 0, "train/loss": 999.0, "train/lr": 0.01})
+    print(f"  W&B run URL: {_wb_run.url}")
+
     # define_metric sets epoch as the x-axis for all train/* and val/* charts.
     _wb_run.define_metric("epoch")
     _wb_run.define_metric("train/*", step_metric="epoch")
