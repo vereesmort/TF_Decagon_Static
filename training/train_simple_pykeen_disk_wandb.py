@@ -18,15 +18,21 @@ Outputs use fixed filenames (checkpoint_best.pt, training_losses.json).
 Use a unique --out_dir / --local_dir per run, or pass --no_clobber on
 fresh runs to abort if those paths already contain checkpoints.
 
-Drive sync strategy (three layers):
-  1. Periodic sync every --sync_every epochs (default 5) via
-     _DriveSyncCallback — copies local checkpoints to a unique staging
-     dir (immutable snapshot), then uploads staging → Drive on a
-     background thread so training does not block on Drive I/O.
-  2. Executor is drained (wait=True), then a final synchronous sync from
-     the live checkpoint dir after training_loop.train() returns.
-  3. checkpoint_best.pt is included whenever it exists in the checkpoint
-     folder at sync time (same as other checkpoint files).
+Drive sync strategy:
+  1. PyKEEN writes checkpoint_epoch.pt (and related state) under --local_dir;
+     EarlyStopper writes checkpoint_best.pt. No custom checkpoint_last.
+  2. Every --sync_every epochs, a background thread runs _sync_checkpoints
+     (local checkpoint dir → Drive). Training thread only submits the job.
+  3. A final synchronous _sync_checkpoints runs after training completes.
+
+  Note: async full-dir copy can theoretically overlap PyKEEN writes to the
+  same filenames; use a large --sync_every if you see rare corrupt copies.
+
+Checkpoint files produced
+-------------------------
+  local_dir/checkpoints/checkpoint_epoch.pt  — PyKEEN (resume here)
+  local_dir/checkpoints/checkpoint_best.pt   — best MRR (EarlyStopper)
+  out_dir/checkpoints/*                      — mirrored periodically + at end
 
 Usage (Colab):
     %cd /content/drive/MyDrive/TF_Decagon_Static/training
@@ -40,7 +46,10 @@ Usage (Colab):
         --embedding_dim 256 \\
         --wandb_project tf-decagon
 
-    # Resume (use local checkpoint_epoch.pt if still in /content/, else Drive copy)
+    # Colab / Jupyter: avoid tqdm flooding the cell output
+    !python train_simple_pykeen_disk_wandb.py ... --no_tqdm
+
+    # Resume (local checkpoint_epoch.pt or copy from Drive)
     !python train_simple_pykeen_disk_wandb.py \\
         --dataset_dir /content/drive/MyDrive/TF_Decagon_Static/data/pykeen/selfloops \\
         --out_dir     /content/drive/MyDrive/TF_Decagon_Static/pykeen_results/simplE_selfloops_fp \\
@@ -48,15 +57,7 @@ Usage (Colab):
         --pretrained_entities /content/drive/MyDrive/TF_Decagon_Static/data/embeddings/fp_only/256.npy \\
         --embedding_dim 256 \\
         --wandb_project tf-decagon \\
-        --resume      /content/drive/MyDrive/TF_Decagon_Static/pykeen_results/simplE_selfloops_fp/checkpoints/checkpoint_epoch.pt
-
-Checkpoint files produced
--------------------------
-  local_dir/checkpoints/checkpoint_last.pt   — custom format, after every epoch
-                                             (CPU snapshot + async torch.save)
-  local_dir/checkpoints/checkpoint_epoch.pt  — PyKEEN format, every N minutes + on crash
-  local_dir/checkpoints/checkpoint_best.pt   — custom format, best MRR so far
-  out_dir/checkpoints/*                      — synced from local_dir every --sync_every epochs
+        --resume      /path/to/checkpoints/checkpoint_epoch.pt
 """
 
 import argparse
@@ -106,91 +107,38 @@ class _ReduceLROnPlateauCallback(TrainingCallback):
             self._n_results_seen = len(results)
 
 
-class _LastCheckpointCallback(TrainingCallback):
-    """Writes checkpoint_last.pt after every epoch via a background thread.
-
-    Snapshots model/optimizer state on the training thread (CPU clones), then
-    torch.save runs asynchronously so weights are not mutated during pickling.
-    A single worker serializes writes to checkpoint_last.pt. Call
-    wait_pending() before reading that file from another step (e.g. Drive sync).
-    """
-
-    def __init__(self, path: Path, executor: ThreadPoolExecutor):
-        super().__init__()
-        self._path = path
-        self._executor = executor
-        self._pending_save = None
-
-    def wait_pending(self) -> None:
-        if self._pending_save is not None:
-            self._pending_save.result()
-            self._pending_save = None
-
-    def post_epoch(self, epoch: int, epoch_loss: float, **kwargs) -> None:
-        model_snap = {
-            k: v.detach().cpu().clone()
-            for k, v in self.model.state_dict().items()
-        }
-        opt_snap = _cpu_clone_tree(self.optimizer.state_dict())
-        payload = {
-            "epoch": epoch,
-            "model_state_dict": model_snap,
-            "optimizer_state_dict": opt_snap,
-            "loss": float(epoch_loss),
-        }
-        path = self._path
-
-        def _save() -> None:
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            torch.save(payload, tmp)
-            os.replace(tmp, path)
-
-        self._pending_save = self._executor.submit(_save)
-
-
 class _DriveSyncCallback(TrainingCallback):
-    """
-    Every sync_every epochs: snapshot local checkpoints into a fresh staging
-    directory (nothing writes to that path again), then copy staging → Drive
-    on a background thread. Training only blocks on the local staging copy.
+    """Queue full local checkpoint dir → Drive (_sync_checkpoints) on a worker.
+
+    Mirrors PyKEEN checkpoint_epoch.pt, EarlyStopper checkpoint_best.pt, etc.
+    Training thread only submits; see module docstring re: rare live-file overlap.
     """
 
     def __init__(
         self,
         local_ckpt_dir: str,
         drive_ckpt_dir: str,
-        staging_root: str,
         executor: ThreadPoolExecutor,
         sync_every: int = 5,
-        flush_before_stage=None,
     ):
         super().__init__()
         self._local = local_ckpt_dir
         self._drive = drive_ckpt_dir
-        self._staging_root = staging_root
         self._executor = executor
         self._every = sync_every
-        self._flush_before_stage = flush_before_stage
 
     def post_epoch(self, epoch: int, epoch_loss: float, **kwargs) -> None:
         if epoch % self._every != 0:
             return
-        if self._flush_before_stage is not None:
-            self._flush_before_stage()
-        os.makedirs(self._staging_root, exist_ok=True)
-        stamp = f"e{epoch}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        stage = os.path.join(self._staging_root, stamp)
-        os.makedirs(stage, exist_ok=True)
-        _sync_checkpoints(self._local, stage, silent=True)
+        loc, drv = self._local, self._drive
+        ep = int(epoch)
 
-        def _upload_and_remove() -> None:
-            try:
-                _sync_checkpoints(stage, self._drive, silent=False)
-            finally:
-                shutil.rmtree(stage, ignore_errors=True)
+        def _job() -> None:
+            _sync_checkpoints(loc, drv, silent=False)
+            print(f"  Drive sync finished (queued at epoch {ep})")
 
-        self._executor.submit(_upload_and_remove)
-        print(f"  Drive sync queued (epoch {epoch}): {stage} → {self._drive}")
+        self._executor.submit(_job)
+        print(f"  Drive sync queued (epoch {ep}): {loc} → {drv}")
 
 
 class _WandbLoggingCallback(TrainingCallback):
@@ -210,7 +158,7 @@ class _WandbLoggingCallback(TrainingCallback):
     def __init__(self, stopper: EarlyStopper, run):
         super().__init__()
         self._stopper = stopper
-        self._run = run          # wandb run object returned by wandb.init()
+        self._run = run
         self._n_results_seen = 0
 
     def post_epoch(self, epoch: int, epoch_loss: float, **kwargs) -> None:
@@ -244,19 +192,6 @@ class _WandbLoggingCallback(TrainingCallback):
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
-def _cpu_clone_tree(obj):
-    """Deep copy with tensors detached/cloned to CPU; preserves structure."""
-    if torch.is_tensor(obj):
-        return obj.detach().cpu().clone()
-    if isinstance(obj, dict):
-        return {k: _cpu_clone_tree(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_cpu_clone_tree(x) for x in obj]
-    if isinstance(obj, tuple):
-        return tuple(_cpu_clone_tree(x) for x in obj)
-    return obj
-
-
 def _sync_checkpoints(src: str, dst: str, silent: bool = False) -> None:
     """Copy every file in src/ to dst/."""
     os.makedirs(dst, exist_ok=True)
@@ -307,9 +242,8 @@ parser.add_argument("--checkpoint_freq", type=int,   default=5,
                     help="Save checkpoint_epoch.pt every N *minutes* (PyKEEN unit).")
 parser.add_argument("--resume",          type=str,   default=None,
                     help="Path to checkpoint to resume from. "
-                         "Use checkpoint_epoch.pt for true epoch continuation, "
-                         "or checkpoint_last.pt / checkpoint_best.pt for "
-                         "weight-only warm-start.")
+                         "Prefer checkpoint_epoch.pt for PyKEEN-native continuation; "
+                         "checkpoint_best.pt loads weights (+ optimizer if compatible).")
 parser.add_argument("--pretrained_entities", type=str, default=None,
                     help="Path to .npy file of shape (n_entities, embedding_dim) "
                          "for pretrained drug embedding initialisation. "
@@ -331,6 +265,12 @@ parser.add_argument("--wandb_run_name", type=str, default=None,
                     help="W&B run name; default: <out_dir_basename>_YYYYMMDD-HHMMSS.")
 parser.add_argument("--no_wandb", action="store_true",
                     help="Disable W&B even if --wandb_project is set.")
+parser.add_argument(
+    "--no_tqdm",
+    action="store_true",
+    help="Disable PyKEEN tqdm bars (recommended in Colab/Jupyter to avoid "
+         "one-line-per-update log spam and browser lag).",
+)
 parser.add_argument(
     "--no_clobber",
     action="store_true",
@@ -388,11 +328,8 @@ print(f"  Checkpoints (local):  {checkpoint_dir}")
 print(f"  Checkpoints (Drive):  {drive_checkpoint_dir}")
 print(f"  Drive sync every:     {args.sync_every} epochs")
 
-drive_sync_staging_root = os.path.join(args.local_dir, ".drive_sync_stage")
 drive_sync_executor = ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="drive_sync")
-last_ckpt_executor = ThreadPoolExecutor(
-    max_workers=1, thread_name_prefix="ckpt_last")
 
 # ---------------------------------------------------------------------------
 # 1. Load TriplesFactory objects
@@ -589,24 +526,17 @@ lr_callback = _ReduceLROnPlateauCallback(
     patience=args.lr_patience,
     threshold=1e-4,
 )
-last_ckpt_callback = _LastCheckpointCallback(
-    path=Path(checkpoint_dir) / "checkpoint_last.pt",
-    executor=last_ckpt_executor,
-)
 sync_callback = _DriveSyncCallback(
     local_ckpt_dir=checkpoint_dir,
     drive_ckpt_dir=drive_checkpoint_dir,
-    staging_root=drive_sync_staging_root,
     executor=drive_sync_executor,
     sync_every=args.sync_every,
-    flush_before_stage=last_ckpt_callback.wait_pending,
 )
 
 _use_wandb = bool(args.wandb_project) and not args.no_wandb
 
 # ---------------------------------------------------------------------------
-# 9. Initialise W&B run (must happen before callbacks are built so the run
-#    object can be passed into _WandbLoggingCallback)
+# 9. Initialise W&B run (before appending _WandbLoggingCallback to the list)
 # ---------------------------------------------------------------------------
 _wb_run = None
 if _use_wandb:
@@ -649,6 +579,7 @@ if _use_wandb:
             "es_min_epochs": args.es_min_epochs,
             "sync_every": args.sync_every,
             "checkpoint_freq": args.checkpoint_freq,
+            "use_tqdm": not args.no_tqdm,
             "train_triples": train_tf.num_triples,
             "valid_triples": valid_tf.num_triples,
             "test_triples": test_tf.num_triples,
@@ -672,7 +603,7 @@ if _use_wandb:
     _wb_run.define_metric("val/*",   step_metric="epoch")
     print(f"  W&B: project={args.wandb_project!r}  run={_wb_run_name!r}")
 
-_train_callbacks = [lr_callback, last_ckpt_callback, sync_callback]
+_train_callbacks = [lr_callback, sync_callback]
 if _use_wandb:
     _train_callbacks.append(_WandbLoggingCallback(stopper=stopper, run=_wb_run))
 
@@ -701,12 +632,9 @@ try:
         checkpoint_name="checkpoint_epoch.pt",
         checkpoint_frequency=args.checkpoint_freq,
         checkpoint_on_failure=True,
-        use_tqdm=True,
+        use_tqdm=not args.no_tqdm,
     )
 finally:
-    print("Draining background checkpoint_last saves...")
-    last_ckpt_callback.wait_pending()
-    last_ckpt_executor.shutdown(wait=True)
     print("Draining background Drive sync jobs...")
     drive_sync_executor.shutdown(wait=True)
 
