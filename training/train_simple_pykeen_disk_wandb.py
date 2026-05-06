@@ -16,11 +16,13 @@ per-epoch Drive write overhead that was causing 2.5 h for 4 epochs.
 
 Drive sync strategy (three layers):
   1. Periodic sync every --sync_every epochs (default 5) via
-     _DriveSyncCallback — protects against mid-run Colab disconnects.
-  2. Final sync after training_loop.train() returns.
-  3. checkpoint_best.pt is always synced immediately when EarlyStopper
-     writes it (it lives in local_dir/checkpoints/ and is included in
-     every periodic sync).
+     _DriveSyncCallback — copies local checkpoints to a unique staging
+     dir (immutable snapshot), then uploads staging → Drive on a
+     background thread so training does not block on Drive I/O.
+  2. Executor is drained (wait=True), then a final synchronous sync from
+     the live checkpoint dir after training_loop.train() returns.
+  3. checkpoint_best.pt is included whenever it exists in the checkpoint
+     folder at sync time (same as other checkpoint files).
 
 Usage (Colab):
     %cd /content/drive/MyDrive/TF_Decagon_Static/training
@@ -47,6 +49,7 @@ Usage (Colab):
 Checkpoint files produced
 -------------------------
   local_dir/checkpoints/checkpoint_last.pt   — custom format, after every epoch
+                                             (CPU snapshot + async torch.save)
   local_dir/checkpoints/checkpoint_epoch.pt  — PyKEEN format, every N minutes + on crash
   local_dir/checkpoints/checkpoint_best.pt   — custom format, best MRR so far
   out_dir/checkpoints/*                      — synced from local_dir every --sync_every epochs
@@ -57,6 +60,7 @@ import json
 import os
 import random
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -99,43 +103,90 @@ class _ReduceLROnPlateauCallback(TrainingCallback):
 
 
 class _LastCheckpointCallback(TrainingCallback):
-    """Saves checkpoint_last.pt to local disk after every epoch."""
+    """Writes checkpoint_last.pt after every epoch via a background thread.
 
-    def __init__(self, path: Path):
+    Snapshots model/optimizer state on the training thread (CPU clones), then
+    torch.save runs asynchronously so weights are not mutated during pickling.
+    A single worker serializes writes to checkpoint_last.pt. Call
+    wait_pending() before reading that file from another step (e.g. Drive sync).
+    """
+
+    def __init__(self, path: Path, executor: ThreadPoolExecutor):
         super().__init__()
         self._path = path
+        self._executor = executor
+        self._pending_save = None
+
+    def wait_pending(self) -> None:
+        if self._pending_save is not None:
+            self._pending_save.result()
+            self._pending_save = None
 
     def post_epoch(self, epoch: int, epoch_loss: float, **kwargs) -> None:
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": self.model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "loss": epoch_loss,
-            },
-            self._path,
-        )
+        model_snap = {
+            k: v.detach().cpu().clone()
+            for k, v in self.model.state_dict().items()
+        }
+        opt_snap = _cpu_clone_tree(self.optimizer.state_dict())
+        payload = {
+            "epoch": epoch,
+            "model_state_dict": model_snap,
+            "optimizer_state_dict": opt_snap,
+            "loss": float(epoch_loss),
+        }
+        path = self._path
+
+        def _save() -> None:
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            torch.save(payload, tmp)
+            os.replace(tmp, path)
+
+        self._pending_save = self._executor.submit(_save)
 
 
 class _DriveSyncCallback(TrainingCallback):
     """
-    Copies all checkpoints from local_dir → drive_dir every sync_every epochs.
-
-    This is the crash-safety layer: if Colab disconnects between syncs you
-    lose at most sync_every epochs of work. Keep sync_every low (5–10) if
-    Drive speed is reasonable; raise it if Drive is the bottleneck.
+    Every sync_every epochs: snapshot local checkpoints into a fresh staging
+    directory (nothing writes to that path again), then copy staging → Drive
+    on a background thread. Training only blocks on the local staging copy.
     """
 
-    def __init__(self, local_ckpt_dir: str, drive_ckpt_dir: str,
-                 sync_every: int = 5):
+    def __init__(
+        self,
+        local_ckpt_dir: str,
+        drive_ckpt_dir: str,
+        staging_root: str,
+        executor: ThreadPoolExecutor,
+        sync_every: int = 5,
+        flush_before_stage=None,
+    ):
         super().__init__()
-        self._local  = local_ckpt_dir
-        self._drive  = drive_ckpt_dir
-        self._every  = sync_every
+        self._local = local_ckpt_dir
+        self._drive = drive_ckpt_dir
+        self._staging_root = staging_root
+        self._executor = executor
+        self._every = sync_every
+        self._flush_before_stage = flush_before_stage
 
     def post_epoch(self, epoch: int, epoch_loss: float, **kwargs) -> None:
-        if epoch % self._every == 0:
-            _sync_checkpoints(self._local, self._drive, silent=False)
+        if epoch % self._every != 0:
+            return
+        if self._flush_before_stage is not None:
+            self._flush_before_stage()
+        os.makedirs(self._staging_root, exist_ok=True)
+        stamp = f"e{epoch}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        stage = os.path.join(self._staging_root, stamp)
+        os.makedirs(stage, exist_ok=True)
+        _sync_checkpoints(self._local, stage, silent=True)
+
+        def _upload_and_remove() -> None:
+            try:
+                _sync_checkpoints(stage, self._drive, silent=False)
+            finally:
+                shutil.rmtree(stage, ignore_errors=True)
+
+        self._executor.submit(_upload_and_remove)
+        print(f"  Drive sync queued (epoch {epoch}): {stage} → {self._drive}")
 
 
 class _WandbLoggingCallback(TrainingCallback):
@@ -189,6 +240,19 @@ class _WandbLoggingCallback(TrainingCallback):
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
+def _cpu_clone_tree(obj):
+    """Deep copy with tensors detached/cloned to CPU; preserves structure."""
+    if torch.is_tensor(obj):
+        return obj.detach().cpu().clone()
+    if isinstance(obj, dict):
+        return {k: _cpu_clone_tree(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_cpu_clone_tree(x) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(_cpu_clone_tree(x) for x in obj)
+    return obj
+
+
 def _sync_checkpoints(src: str, dst: str, silent: bool = False) -> None:
     """Copy every file in src/ to dst/."""
     os.makedirs(dst, exist_ok=True)
@@ -287,6 +351,12 @@ os.makedirs(drive_checkpoint_dir, exist_ok=True)
 print(f"  Checkpoints (local):  {checkpoint_dir}")
 print(f"  Checkpoints (Drive):  {drive_checkpoint_dir}")
 print(f"  Drive sync every:     {args.sync_every} epochs")
+
+drive_sync_staging_root = os.path.join(args.local_dir, ".drive_sync_stage")
+drive_sync_executor = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="drive_sync")
+last_ckpt_executor = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="ckpt_last")
 
 # ---------------------------------------------------------------------------
 # 1. Load TriplesFactory objects
@@ -485,11 +555,15 @@ lr_callback = _ReduceLROnPlateauCallback(
 )
 last_ckpt_callback = _LastCheckpointCallback(
     path=Path(checkpoint_dir) / "checkpoint_last.pt",
+    executor=last_ckpt_executor,
 )
 sync_callback = _DriveSyncCallback(
     local_ckpt_dir=checkpoint_dir,
     drive_ckpt_dir=drive_checkpoint_dir,
+    staging_root=drive_sync_staging_root,
+    executor=drive_sync_executor,
     sync_every=args.sync_every,
+    flush_before_stage=last_ckpt_callback.wait_pending,
 )
 
 _use_wandb = bool(args.wandb_project) and not args.no_wandb
@@ -579,6 +653,7 @@ print(f"  Early stopping: patience={args.es_patience} checks × "
       f"{args.es_frequency} epochs = {args.es_patience * args.es_frequency} "
       f"epochs max wait")
 
+losses = None
 try:
     losses = training_loop.train(
         triples_factory=train_tf,
@@ -592,31 +667,40 @@ try:
         checkpoint_on_failure=True,
         use_tqdm=True,
     )
+finally:
+    print("Draining background checkpoint_last saves...")
+    last_ckpt_callback.wait_pending()
+    last_ckpt_executor.shutdown(wait=True)
+    print("Draining background Drive sync jobs...")
+    drive_sync_executor.shutdown(wait=True)
 
-    # -----------------------------------------------------------------------
-    # 11. Final sync + save results
-    # -----------------------------------------------------------------------
-    print("\nFinal sync: local → Drive...")
-    _sync_checkpoints(checkpoint_dir, drive_checkpoint_dir, silent=False)
+try:
+    if losses is not None:
+        # -------------------------------------------------------------------
+        # 11. Final sync + save results (live dir — catches checkpoints after
+        #     the last async job was queued)
+        # -------------------------------------------------------------------
+        print("\nFinal sync: local → Drive...")
+        _sync_checkpoints(checkpoint_dir, drive_checkpoint_dir, silent=False)
 
-    results_path = os.path.join(args.out_dir, "training_losses.json")
-    with open(results_path, "w") as f:
-        json.dump(losses, f)
-    print(f"Training losses saved to {results_path}")
+        results_path = os.path.join(args.out_dir, "training_losses.json")
+        with open(results_path, "w") as f:
+            json.dump(losses, f)
+        print(f"Training losses saved to {results_path}")
 
-    if _use_wandb:
-        import wandb
+        if _use_wandb:
+            import wandb
 
-        art = wandb.Artifact("training_losses", type="results")
-        art.add_file(results_path)
-        _wb_run.log_artifact(art)
+            art = wandb.Artifact("training_losses", type="results")
+            art.add_file(results_path)
+            _wb_run.log_artifact(art)
 
-    print(f"Best checkpoint (Drive): {drive_checkpoint_dir}/checkpoint_best.pt")
-    print(f"Run assessment with:")
-    print(f"  python assessment/assessment_pykeen.py \\")
-    print(f"      --checkpoint {drive_checkpoint_dir}/checkpoint_best.pt \\")
-    print(f"      --dataset_dir {args.dataset_dir} \\")
-    print(f"      --out_dir {args.out_dir}/assessment")
+        print(f"Best checkpoint (Drive): {drive_checkpoint_dir}/checkpoint_best.pt")
+        print(f"Run assessment with:")
+        print(f"  python assessment/assessment_pykeen.py \\")
+        print(f"      --checkpoint {drive_checkpoint_dir}/checkpoint_best.pt \\")
+        print(f"      --dataset_dir {args.dataset_dir} \\")
+        print(f"      --out_dir {args.out_dir}/assessment")
 finally:
     if _use_wandb:
         import wandb
