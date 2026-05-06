@@ -13,3 +13,4 @@ analysis/experiments/non-naive
 analysis/experiments/selfloops
 **/*.pt
 /results/
+/wandb/
