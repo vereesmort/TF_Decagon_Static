@@ -8,8 +8,29 @@ from numpy.random import seed
 
 seed(0)
 
+_script_dir = Path(__file__).resolve().parent
+
 parser = argparse.ArgumentParser(
     description="Split polypharmacy edges into train/holdout with SE stratification.",
+)
+parser.add_argument(
+    "--edgelist",
+    type=str,
+    default=str(_script_dir / "polypharmacy_edges.tsv"),
+    help=(
+        "Polypharmacy TSV edgelist (no header, tab-separated): "
+        "head_entity, relation (side-effect ID), tail_entity — "
+        "e.g. output from process_raw_data.py under polypharmacy/."
+    ),
+)
+parser.add_argument(
+    "--combo_csv",
+    type=str,
+    default=str(_script_dir.parent.parent / "raw" / "bio-decagon-combo.csv"),
+    help=(
+        "Decagon bio-decagon-combo.csv; column 'Polypharmacy Side Effect' "
+        "defines which relation values are split by SE."
+    ),
 )
 parser.add_argument(
     "--out_dir",
@@ -18,18 +39,26 @@ parser.add_argument(
     help="Directory for train_polypharmacy.tsv and holdout_polypharmacy.tsv.",
 )
 args = parser.parse_args()
+edgelist_path = Path(args.edgelist).expanduser().resolve()
+combo_csv_path = Path(args.combo_csv).expanduser().resolve()
 out_dir = Path(args.out_dir).resolve()
 out_dir.mkdir(parents=True, exist_ok=True)
 
-# Load target edgelist
+if not edgelist_path.is_file():
+    raise FileNotFoundError(f"--edgelist not found: {edgelist_path}")
+if not combo_csv_path.is_file():
+    raise FileNotFoundError(f"--combo_csv not found: {combo_csv_path}")
+
+# Load target edgelist (h, r, t)
 edges = pd.read_csv(
-    'polypharmacy_edges.tsv', 
-    header=None, sep='\t', 
-    dtype={0:str, 1:str, 2:str}
+    edgelist_path,
+    header=None,
+    sep="\t",
+    dtype={0: str, 1: str, 2: str},
 )
 
-# Get list of polypharmacy side effects
-poly_edges = pd.read_csv('../../raw/bio-decagon-combo.csv')['Polypharmacy Side Effect'].unique()
+# Side-effect relation IDs present in the raw combo file (used to filter/group edges)
+poly_edges = pd.read_csv(combo_csv_path)["Polypharmacy Side Effect"].unique()
 
 # Create holdout data that has 10% of each polypharmacy side effect
 done = False

@@ -4,8 +4,19 @@ from pathlib import Path
 import pandas as pd
 from os import listdir
 
+_script_dir = Path(__file__).resolve().parent
+
 parser = argparse.ArgumentParser(
     description="Process bio-decagon raw CSVs into LibKGE-style TSV edgelists."
+)
+parser.add_argument(
+    "--raw_dir",
+    type=str,
+    default=str(_script_dir.parent / "raw"),
+    help=(
+        "Directory containing bio-decagon-*.csv (Decagon raw downloads). "
+        "Default: data/raw relative to this script."
+    ),
 )
 parser.add_argument(
     "--out_dir",
@@ -14,6 +25,9 @@ parser.add_argument(
     help="Directory to write output TSV files (default: current working directory).",
 )
 args = parser.parse_args()
+raw_dir = Path(args.raw_dir).expanduser().resolve()
+if not raw_dir.is_dir():
+    raise NotADirectoryError(f"--raw_dir is not a directory: {raw_dir}")
 out_dir = Path(args.out_dir).resolve()
 out_dir.mkdir(parents=True, exist_ok=True)
 poly_out_dir = out_dir / "polypharmacy"
@@ -27,9 +41,9 @@ name_converter = {
     'targets': 'drug-target'
 }
 dfs = {}
-for f in listdir('../raw'):
+for f in listdir(raw_dir):
     if f.startswith('bio-decagon'):
-        df = pd.read_csv(f'../raw/{f}')
+        df = pd.read_csv(raw_dir / f)
         f = f.split('-')[-1][:-4]
         new_name = name_converter[f]
         dfs[new_name] = df
