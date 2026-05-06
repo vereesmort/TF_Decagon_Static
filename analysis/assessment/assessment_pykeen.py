@@ -36,6 +36,13 @@ Usage:
         --out_dir     results/simplE_selfloops/assessment_subset/ \\
         --ses C0000039 C0002871 C0003126
 
+    # Custom negatives directory (each file: {SE}.tsv)
+    python assessment_pykeen.py \\
+        --checkpoint ... \\
+        --dataset_dir data/pykeen/selfloops \\
+        --out_dir ... \\
+        --false_edges_dir /path/to/false_edges_pykeen
+
     # Resume after interruption
     python assessment_pykeen.py \\
         --checkpoint  results/simplE_selfloops/checkpoints/checkpoint_best.pt \\
@@ -44,8 +51,9 @@ Usage:
         --partial_results results/simplE_selfloops/assessment/results_temp.csv
 
 Prerequisites:
-    - false_edges/ directory must exist and be populated.
+    - Per-SE negative TSVs must exist (default dir: analysis/assessment/false_edges_pykeen/).
       Run create_false_edges_pykeen.py first if not done.
+    - Override location with --false_edges_dir /path/to/dir
     - holdout_polypharmacy.tsv must exist at:
       ../../data/processed/polypharmacy/holdout_polypharmacy.tsv
 """
@@ -81,7 +89,15 @@ parser.add_argument("--holdout",         default=None,
                     help="Path to holdout_polypharmacy.tsv. "
                          "Defaults to ../../data/processed/polypharmacy/holdout_polypharmacy.tsv "
                          "relative to this script (works when run from analysis/assessment/).")
+parser.add_argument("--false_edges_dir", default=None,
+                    help="Directory of {SE}.tsv negatives from create_false_edges_pykeen.py. "
+                         "Default: false_edges_pykeen/ next to this script "
+                         "(same layout as running that script from analysis/assessment/).")
 args = parser.parse_args()
+
+_false_edges_dir = args.false_edges_dir or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "false_edges_pykeen"
+)
 
 np.random.seed(0)
 os.makedirs(args.out_dir, exist_ok=True)
@@ -222,6 +238,7 @@ else:
 se_types = holdout["r"].unique()
 total    = len(se_types)
 print(f"\nAssessing {total} SE types...")
+print(f"  False edges dir: {_false_edges_dir}")
 
 for i, se_name in enumerate(se_types):
 
@@ -235,8 +252,8 @@ for i, se_name in enumerate(se_types):
     pos_r = pos_group["r_id"].tolist()
     pos_t = pos_group["t_id"].tolist()
 
-    # Load false (negative) edges from false_edges_pykeen/ (string-name format)
-    false_edge_file = os.path.join("false_edges_pykeen", f"{se_name}.tsv")
+    # Load false (negative) edges (string-name TSVs; see --false_edges_dir)
+    false_edge_file = os.path.join(_false_edges_dir, f"{se_name}.tsv")
     if not os.path.exists(false_edge_file):
         print(f"  [{i+1}/{total}] {se_name}: no false edges file, skipping.")
         print(f"    Run create_false_edges_pykeen.py to generate it.")
