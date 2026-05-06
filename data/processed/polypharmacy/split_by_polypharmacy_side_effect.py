@@ -1,9 +1,25 @@
+import argparse
+from pathlib import Path
+
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from numpy.random import seed
 
 
 seed(0)
+
+parser = argparse.ArgumentParser(
+    description="Split polypharmacy edges into train/holdout with SE stratification.",
+)
+parser.add_argument(
+    "--out_dir",
+    type=str,
+    default=".",
+    help="Directory for train_polypharmacy.tsv and holdout_polypharmacy.tsv.",
+)
+args = parser.parse_args()
+out_dir = Path(args.out_dir).resolve()
+out_dir.mkdir(parents=True, exist_ok=True)
 
 # Load target edgelist
 edges = pd.read_csv(
@@ -46,5 +62,10 @@ while not done:
         print('Holdout set contains nodes unseen to train data. Trying again..')
 
 # Save
-train_df.to_csv('train_polypharmacy.tsv', header=None, index=False, sep='\t')
-holdout_df.to_csv('holdout_polypharmacy.tsv', header=None, index=False, sep='\t')
+train_df.to_csv(
+    out_dir / "train_polypharmacy.tsv", header=None, index=False, sep="\t"
+)
+holdout_df.to_csv(
+    out_dir / "holdout_polypharmacy.tsv", header=None, index=False, sep="\t"
+)
+print(f"Wrote train/holdout under {out_dir}")

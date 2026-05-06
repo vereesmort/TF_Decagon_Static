@@ -1,5 +1,23 @@
+import argparse
+from pathlib import Path
+
 import pandas as pd
 from os import listdir
+
+parser = argparse.ArgumentParser(
+    description="Process bio-decagon raw CSVs into LibKGE-style TSV edgelists."
+)
+parser.add_argument(
+    "--out_dir",
+    type=str,
+    default=".",
+    help="Directory to write output TSV files (default: current working directory).",
+)
+args = parser.parse_args()
+out_dir = Path(args.out_dir).resolve()
+out_dir.mkdir(parents=True, exist_ok=True)
+poly_out_dir = out_dir / "polypharmacy"
+poly_out_dir.mkdir(parents=True, exist_ok=True)
 
 # Load in data
 name_converter = {
@@ -43,8 +61,19 @@ dfs['polypharmacy'] = dfs['polypharmacy'].loc[dfs['polypharmacy']['r'].isin(poly
 
 # Save core graph to disk in LibKGE format
 core_network = pd.concat([dfs['ppi'], dfs['drug-target']], ignore_index=True)
-core_network.to_csv('core_network_ppi_drugtarget.tsv', index=False, header=None, sep='\t')
+core_network.to_csv(
+    out_dir / "core_network_ppi_drugtarget.tsv",
+    index=False, header=None, sep="\t",
+)
 
 # Save Mono-/Polypharmacy side effect data to disk in LibKGE format
-dfs['monopharmacy'].to_csv('monopharmacy_edges.tsv', index=False, header=None, sep='\t')
-dfs['polypharmacy'].to_csv('polypharmacy/polypharmacy_edges.tsv', index=False, header=None, sep='\t')
+dfs['monopharmacy'].to_csv(
+    out_dir / "monopharmacy_edges.tsv",
+    index=False, header=None, sep="\t",
+)
+dfs['polypharmacy'].to_csv(
+    poly_out_dir / "polypharmacy_edges.tsv",
+    index=False, header=None, sep="\t",
+)
+
+print(f"Wrote outputs under {out_dir}")
