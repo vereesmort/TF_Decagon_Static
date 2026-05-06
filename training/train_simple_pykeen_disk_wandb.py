@@ -14,6 +14,10 @@ All checkpoint I/O goes to a fast local directory (--local_dir, e.g.
 /content/ckpt) instead of Google Drive. This eliminates the ~5 min
 per-epoch Drive write overhead that was causing 2.5 h for 4 epochs.
 
+Outputs use fixed filenames (checkpoint_best.pt, training_losses.json).
+Use a unique --out_dir / --local_dir per run, or pass --no_clobber on
+fresh runs to abort if those paths already contain checkpoints.
+
 Drive sync strategy (three layers):
   1. Periodic sync every --sync_every epochs (default 5) via
      _DriveSyncCallback — copies local checkpoints to a unique staging
@@ -327,7 +331,41 @@ parser.add_argument("--wandb_run_name", type=str, default=None,
                     help="W&B run name; default: <out_dir_basename>_YYYYMMDD-HHMMSS.")
 parser.add_argument("--no_wandb", action="store_true",
                     help="Disable W&B even if --wandb_project is set.")
+parser.add_argument(
+    "--no_clobber",
+    action="store_true",
+    help="Abort before any setup if outputs already exist under --out_dir or "
+         "--local_dir (fresh runs only; omit when using --resume). "
+         "Does not run after training.",
+)
 args = parser.parse_args()
+
+checkpoint_dir = os.path.join(args.local_dir, "checkpoints")
+drive_checkpoint_dir = os.path.join(args.out_dir, "checkpoints")
+
+if args.no_clobber and not args.resume:
+
+    def _dir_has_pt(d: str) -> bool:
+        if not os.path.isdir(d):
+            return False
+        return any(name.endswith(".pt") for name in os.listdir(d))
+
+    losses_path = os.path.join(args.out_dir, "training_losses.json")
+    if os.path.isfile(losses_path):
+        raise SystemExit(
+            f"--no_clobber: refusing to overwrite completed run artifact:\n  {losses_path}\n"
+            "Use a new --out_dir (e.g. add a timestamp) or omit --no_clobber."
+        )
+    if _dir_has_pt(drive_checkpoint_dir):
+        raise SystemExit(
+            f"--no_clobber: --out_dir already has checkpoints:\n  {drive_checkpoint_dir}\n"
+            "Use a new --out_dir or use --resume and omit --no_clobber."
+        )
+    if _dir_has_pt(checkpoint_dir):
+        raise SystemExit(
+            f"--no_clobber: --local_dir already has checkpoints:\n  {checkpoint_dir}\n"
+            "Use a new --local_dir or use --resume and omit --no_clobber."
+        )
 
 # ---------------------------------------------------------------------------
 # Seeding + device
@@ -344,9 +382,7 @@ print(f"Device: {device}  |  seed: {args.seed}")
 # ---------------------------------------------------------------------------
 # Checkpoint directories
 # ---------------------------------------------------------------------------
-checkpoint_dir       = os.path.join(args.local_dir, "checkpoints")   # fast local
-drive_checkpoint_dir = os.path.join(args.out_dir,   "checkpoints")   # Drive
-os.makedirs(checkpoint_dir,       exist_ok=True)
+os.makedirs(checkpoint_dir, exist_ok=True)
 os.makedirs(drive_checkpoint_dir, exist_ok=True)
 print(f"  Checkpoints (local):  {checkpoint_dir}")
 print(f"  Checkpoints (Drive):  {drive_checkpoint_dir}")
