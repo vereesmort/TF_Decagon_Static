@@ -9,7 +9,8 @@ drug pairs not in the positive set.  The only change is that it reads
 drug CIDs from entity_to_id.json (produced by make_pykeen_datasets.py)
 instead of from LibKGE's entity_ids.del file.
 
-The output format is unchanged: one TSV per SE type in false_edges/,
+The output format is unchanged: one TSV per SE type in the output directory
+(--out_dir, default: false_edges_pykeen/ next to this script),
 with string entity names (not integer IDs) — assessment_pykeen.py
 converts them to IDs during scoring.
 
@@ -19,6 +20,11 @@ Usage:
     python create_false_edges_pykeen.py \\
         --dataset_dir data/pykeen/selfloops \\
         --n_cores     8      # default: all CPU cores
+
+    # Write negatives somewhere other than the default directory
+    python create_false_edges_pykeen.py \\
+        --dataset_dir data/pykeen/selfloops \\
+        --out_dir     /path/to/false_edges_pykeen
 """
 
 import argparse
@@ -29,12 +35,27 @@ import os
 import numpy as np
 import pandas as pd
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--dataset_dir", required=True,
                     help="Directory with entity_to_id.json / relation_to_id.json")
+parser.add_argument(
+    "--out_dir",
+    default=None,
+    help="Output directory for one {SE}.tsv per side effect (default: "
+         "false_edges_pykeen/ next to this script — same default as "
+         "assessment_pykeen.py --false_edges_dir).",
+)
 parser.add_argument("--n_cores", type=int, default=None,
                     help="Number of CPU cores (default: all)")
 args = parser.parse_args()
+
+out_dir = os.path.abspath(
+    args.out_dir if args.out_dir is not None
+    else os.path.join(_SCRIPT_DIR, "false_edges_pykeen")
+)
+print(f"Output directory: {out_dir}")
 
 # ---------------------------------------------------------------------------
 # Load entity/relation mappings
@@ -78,7 +99,7 @@ except Exception as e:
           f"Using holdout only for exclusion.")
     all_edges = holdout
 
-os.makedirs("false_edges_pykeen", exist_ok=True)
+os.makedirs(out_dir, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Negative edge generation (identical logic to original)
@@ -96,7 +117,7 @@ def create_negative_edges(n_fake, pos_edges_set, se_name):
 
 parallel_args = []
 for se_name, group in holdout.groupby("r"):
-    false_edge_file = f"false_edges_pykeen/{se_name}.tsv"
+    false_edge_file = os.path.join(out_dir, f"{se_name}.tsv")
     if os.path.exists(false_edge_file):
         print(f"  {se_name}: existing file found, skipping.")
         continue
@@ -119,7 +140,8 @@ for neg_edges in results:
     if neg_edges:
         se_name = neg_edges[0][1]
         pd.DataFrame(neg_edges, columns=["h", "r", "t"]).to_csv(
-            f"false_edges_pykeen/{se_name}.tsv", header=False, index=False, sep="\t"
+            os.path.join(out_dir, f"{se_name}.tsv"),
+            header=False, index=False, sep="\t",
         )
 
-print(f"Done. {len(os.listdir('false_edges_pykeen'))} files in false_edges_pykeen/")
+print(f"Done. {len(os.listdir(out_dir))} files in {out_dir}/")
