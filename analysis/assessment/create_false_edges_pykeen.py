@@ -21,10 +21,11 @@ Usage:
         --dataset_dir data/pykeen/selfloops \\
         --n_cores     8      # default: all CPU cores
 
-    # Write negatives somewhere other than the default directory
+    # Write negatives & holdout to custom directories
     python create_false_edges_pykeen.py \\
         --dataset_dir data/pykeen/selfloops \\
-        --out_dir     /path/to/false_edges_pykeen
+        --out_dir     /path/to/false_edges_pykeen \\
+        --holdout     /path/to/holdout_polypharmacy.tsv
 """
 
 import argparse
@@ -47,6 +48,13 @@ parser.add_argument(
          "false_edges_pykeen/ next to this script — same default as "
          "assessment_pykeen.py --false_edges_dir).",
 )
+parser.add_argument(
+    "--holdout",
+    default=None,
+    help="Path to holdout_polypharmacy.tsv (h, r, t — no header). "
+         "Default: ../../data/processed/polypharmacy/holdout_polypharmacy.tsv "
+         "relative to this script (same as assessment_pykeen.py).",
+)
 parser.add_argument("--n_cores", type=int, default=None,
                     help="Number of CPU cores (default: all)")
 args = parser.parse_args()
@@ -56,6 +64,16 @@ out_dir = os.path.abspath(
     else os.path.join(_SCRIPT_DIR, "false_edges_pykeen")
 )
 print(f"Output directory: {out_dir}")
+
+_holdout_path = (
+    args.holdout
+    if args.holdout is not None
+    else os.path.join(
+        _SCRIPT_DIR, "../../data/processed/polypharmacy/holdout_polypharmacy.tsv"
+    )
+)
+holdout_path = os.path.normpath(os.path.abspath(_holdout_path))
+print(f"Holdout TSV: {holdout_path}")
 
 # ---------------------------------------------------------------------------
 # Load entity/relation mappings
@@ -70,10 +88,10 @@ compound_ids = [name for name in entity_to_id if name.startswith("CID")]
 print(f"  {len(compound_ids)} drug nodes available for negative sampling")
 
 # ---------------------------------------------------------------------------
-# Load holdout (same relative path as original)
+# Load holdout
 # ---------------------------------------------------------------------------
 holdout = pd.read_csv(
-    "../../data/processed/polypharmacy/holdout_polypharmacy.tsv",
+    holdout_path,
     header=None, sep="\t", names=["h", "r", "t"], dtype=str
 )
 print(f"  {len(holdout):,} holdout edges across {holdout['r'].nunique()} SE types")
